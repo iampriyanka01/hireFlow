@@ -1,22 +1,86 @@
 """
-AI-powered candidate evaluation and ranking system.
-Uses LLM to assess candidate fit and provide detailed feedback.
+core/re_ranker.py  -  AI CANDIDATE EVALUATION
+=============================================
+
+Role in the pipeline
+    Search returns candidates that LOOK relevant. The ReRanker reads the
+    resume against the job description and produces a human-style verdict:
+
+        (Resume, JobDescription) ──> Gemini LLM ──> CandidateEvaluation
+                                                     fit_score  (0-100)
+                                                     strengths  (list)
+                                                     gaps       (list)
+                                                     risks      (list)
+                                                     summary    (text)
+
+Two modes
+    LLM mode  : evaluate_candidate() prompts Gemini and parses the answer.
+    Fallback  : simple_evaluation() compares skills / years of experience with
+                plain rules when no API key is set or the LLM call fails.
+
+Public API
+    evaluate_candidate(resume, jd)      -> CandidateEvaluation (one candidate)
+    re_rank_candidates(candidates, jd)  -> list[CandidateEvaluation], best first
+    is_available()                      -> True if the LLM client exists
+
+Data models (Resume, JobDescription, CandidateEvaluation) live in
+utils/schemas.py.
 """
 
 from typing import List, Dict, Any
+from pydantic import BaseModel, Field
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.output_parsers import PydanticOutputParser
+from langchain_core.prompts import PromptTemplate
 from utils.config import GOOGLE_API_KEY, LLM_MODEL
 from utils.schemas import Resume, JobDescription, CandidateEvaluation
 from utils.utils import get_logger, get_rate_limiter
 
 logger = get_logger(__name__)
 
+
+class _FitAssessment(BaseModel):
+    """Fix for HW16/HW17: ask the LLM to output the assessment as structured JSON,
+    instead of free text that this code then has to guess the shape of.
+
+    This replaces the old fit_score formula (50 + 15*len(strengths) - 10*len(gaps)),
+    which - because the prompt always asked for exactly 3 strengths and 3 improvement
+    areas - gave nearly every candidate the same score (HW16). It also replaces the
+    fragile extract_section()/extract_summary() text-scraping, which is why 'gaps' was
+    always empty (HW17): the prompt asked for "areas for improvement" but the code
+    searched the reply for the word "gaps", a heading the LLM was never asked to write.
+    """
+    fit_score: int = Field(ge=0, le=100, description="Overall fit for the role, 0-100, "
+                           "based on skills, experience and role alignment - not just counts")
+    strengths: List[str] = Field(default_factory=list, description="Up to 3 concise strengths")
+    gaps: List[str] = Field(default_factory=list, description="Up to 3 concise gaps or missing requirements")
+    risks: List[str] = Field(default_factory=list, description="Any hiring risks; empty list if none")
+    summary: str = Field(description="One or two sentence overall summary")
+
 class ReRanker:
-    """LLM-powered candidate evaluation with detailed fit analysis"""
+    """Scores and explains how well a candidate fits a job."""
     
     def __init__(self):
-        """Initialize LLM for candidate evaluation or fall back to rule-based"""
+        """Create the Gemini client if an API key exists; otherwise leave `self.llm` as None.
+
+        With `self.llm` None every evaluation transparently uses the
+        rule-based simple_evaluation().
+        """
         self.llm = None
+        # Fix for HW16/HW17: parse the LLM's assessment as structured JSON (same
+        # PydanticOutputParser technique parsing.py uses), instead of scraping free text.
+        self.output_parser = PydanticOutputParser(pydantic_object=_FitAssessment)
+        self.prompt_template = PromptTemplate(
+            template="""You are an expert recruiter. Analyze this candidate for the job below and
+give an honest, differentiated fit_score - not the same score for every candidate.
+
+JOB: {job_text}
+CANDIDATE: {resume_text}
+
+{format_instructions}""",
+            input_variables=["job_text", "resume_text"],
+            partial_variables={"format_instructions": self.output_parser.get_format_instructions()}
+        )
         try:
             if not GOOGLE_API_KEY:
                 return
@@ -30,53 +94,33 @@ class ReRanker:
             self.llm = None
 
     def evaluate_candidate(self, resume: Resume, jd: JobDescription) -> CandidateEvaluation:
-        """Analyze candidate fit using LLM to generate detailed evaluation"""
+        """Evaluate ONE candidate against ONE job.
+
+        Steps:
+          1. no LLM available -> return simple_evaluation()
+          2. prompt the LLM for strengths, improvement areas, risks, summary
+          3. cut the reply into sections with extract_section()/extract_summary()
+          4. compute fit_score from the number of strengths and gaps
+          5. return a CandidateEvaluation (falls back to simple_evaluation()
+             on any exception)
+        """
         if not self.llm:
             return self.simple_evaluation(resume, jd)
         
         try:
-            prompt = f"""
-            Analyze this candidate for the job:
-
-            JOB: {jd.text}
-            CANDIDATE: {resume.text}
-
-            Give me:
-            1. 3 key strengths
-            2. 3 areas for improvement  
-            3. Any risks
-            4. A brief summary
-
-            Format with clear sections.
-            """
-            
-            response = self.llm.invoke(prompt)
-            eval_text = response.content
-            
-            strengths = self.extract_section(eval_text, "strengths", 3)
-            # TODO: HW17 [Easy] - Gaps are always empty
-            # This searches the reply for a heading containing 'gaps'. What heading did
-            # the prompt above ask the LLM to use? Also: extract_section() lowercases
-            # every line it returns - check how strengths look in the UI.
-            gaps = self.extract_section(eval_text, "gaps", 3)
-            risks = self.extract_section(eval_text, "risks", 5)
-            summary = self.extract_summary(eval_text)
-            
-            # TODO: HW16 [Medium] - Every candidate gets the same fit score
-            # The prompt asks for exactly 3 strengths and 3 improvements. Work out what
-            # this formula returns for every candidate. Does the ranking mean anything?
-            # Ask the LLM for the score itself, as structured output - parsing.py already
-            # uses PydanticOutputParser; the same technique works here.
-            # Hint: Session 6 - Part 5, output parsers.
-            fit_score = min(100, max(0, 50 + len(strengths) * 15 - len(gaps) * 10))
+            # Fix for HW16/HW17: ask the LLM for the score directly, as structured JSON,
+            # instead of counting bullet points under headings that may not match what
+            # the prompt asked for. See _FitAssessment above for what this replaces.
+            chain = self.prompt_template | self.llm | self.output_parser
+            assessment = chain.invoke({"job_text": jd.text, "resume_text": resume.text})
             
             return CandidateEvaluation(
                 candidate_id=resume.candidate_id,
-                fit_score=fit_score,
-                strengths=strengths,
-                gaps=gaps,
-                risks=risks,
-                summary=summary
+                fit_score=assessment.fit_score,
+                strengths=assessment.strengths[:3],
+                gaps=assessment.gaps[:3],
+                risks=assessment.risks[:5],
+                summary=assessment.summary
             )
             
         except Exception as e:
@@ -84,7 +128,16 @@ class ReRanker:
             return self.simple_evaluation(resume, jd)
 
     def extract_section(self, text: str, section_name: str, max_items: int) -> List[str]:
-        """Parse LLM response to extract specific sections (strengths, gaps, risks)"""
+        """Superseded by the structured-output fix for HW16/HW17 (evaluate_candidate() no
+        longer calls this) - kept only in case other code still depends on it.
+
+        Pull the bullet points under one heading out of the LLM's free-text reply.
+
+        Walks the reply line by line: starts collecting after a line containing
+        `section_name`, stops at the next known heading, and keeps up to
+        `max_items` bullet lines ("-", "•", "*", "1." ...) with markers removed.
+        Note: lines are lowercased while parsing.
+        """
         items = []
         lines = text.split('\n')
         in_section = False
@@ -107,7 +160,12 @@ class ReRanker:
         return items
 
     def extract_summary(self, text: str) -> str:
-        """Extract summary section from LLM evaluation response"""
+        """Superseded by the structured-output fix for HW16/HW17 - kept for compatibility.
+
+        Return the first few non-bullet lines after the "summary" heading (joined into one string).
+
+        Falls back to "Evaluation completed" if no summary is found.
+        """
         lines = text.split('\n')
         summary_lines = []
         
@@ -123,7 +181,13 @@ class ReRanker:
         return ' '.join(summary_lines) if summary_lines else "Evaluation completed"
 
     def simple_evaluation(self, resume: Resume, jd: JobDescription) -> CandidateEvaluation:
-        """Fallback rule-based evaluation when LLM is unavailable"""
+        """Rule-based evaluation used when the LLM is unavailable or fails.
+
+        Rules:
+          - experience >= job's min_experience  -> strength, else gap
+          - any resume skill in job's required_skills -> strength, else gap
+        Score = 50 + 20 per strength - 15 per gap, clamped to 0-100.
+        """
         strengths = []
         gaps = []
         
@@ -155,7 +219,12 @@ class ReRanker:
         )
 
     def re_rank_candidates(self, candidates: List[Dict[str, Any]], jd: JobDescription) -> List[CandidateEvaluation]:
-        """Evaluate and rank all candidates by job fit score"""
+        """Evaluate every candidate and return the evaluations sorted best-first.
+
+        Accepts search-result dicts (or Resume objects). Dicts are converted to
+        Resume models first (text is read from 'page_content' or 'text').
+        Costs ONE LLM request per candidate, so keep the list short.
+        """
         if not candidates:
             return []
         
@@ -185,5 +254,5 @@ class ReRanker:
         return evaluations
 
     def is_available(self) -> bool:
-        """Check if LLM is available for evaluation"""
+        """True when the Gemini client was created (LLM mode), False in fallback mode."""
         return self.llm is not None

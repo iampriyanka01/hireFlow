@@ -1,12 +1,43 @@
 """
-RAGAS-based evaluation system for measuring search quality.
-Evaluates retrieval and answer generation performance using standard metrics.
+core/evaluator.py  -  MEASURING SEARCH QUALITY with RAGAS
+=========================================================
+
+Role in the pipeline
+    Answers the question "is our search actually good?" with numbers.
+    RAGAS is a library that uses an LLM as a judge to score RAG systems.
+
+    query ─> SearchRouter.search() ─> candidates
+          ─> prepare_ragas_data()   ─> one row per candidate:
+                 question      = the query
+                 contexts      = text describing the candidate
+                 answer        = a generated sentence about the candidate
+                 ground_truth  = "Excellent/Good/Moderate/Poor match: x/y skills"
+          ─> ragas.evaluate()       ─> 4 metrics
+          ─> weighted overall_score ─> stored in evaluation_history
+
+The four metrics (all 0.0 - 1.0, higher is better)
+    answer_relevancy   - does the answer address the question?           (30%)
+    context_precision  - are the retrieved contexts relevant / well ranked? (30%)
+    faithfulness       - is the answer supported by the context?          (20%)
+    answer_correctness - does the answer match the ground truth?          (20%)
+
+Cost warning
+    Each metric makes several LLM calls per row, and the free Gemini tier is
+    limited to ~5 requests/minute, so an evaluation with top_k=5 can take many
+    minutes. run_config() limits RAGAS to 1 worker with long timeouts for
+    that reason.
+
+Public API
+    RAGEvaluator.evaluate_search_quality(query, expected_skills, ...)
+    RAGEvaluator.get_evaluation_summary() / export_evaluations(filename)
 """
 
 from typing import Dict, Any, List, Optional
 import pandas as pd
 from dataclasses import dataclass
 from core.search_router import SearchRouter
+from core.re_ranker import ReRanker
+from utils.schemas import JobDescription, Resume
 from utils.utils import get_logger
 from ragas import evaluate
 from ragas.metrics import (
@@ -17,45 +48,85 @@ logger = get_logger(__name__)
 
 @dataclass
 class RAGEvaluationMetrics:
-    """Container for RAGAS evaluation metrics with scoring"""
+    """Result of one evaluation: the four RAGAS metrics plus a weighted overall score."""
     answer_relevancy: float     # How relevant the answer is to the question
     context_precision: float    # Precision of retrieved context
     faithfulness: float         # Factual consistency with context
     answer_correctness: float   # Overall answer quality
     overall_score: float        # Weighted average of all metrics
+    # Fix for HW21: True when RAGAS could not score at least one metric for at least one
+    # candidate (NaN from a quota error, timeout, or unparseable judge reply), or when
+    # there was nothing to evaluate at all. A caller should treat a low score with
+    # judge_failed=True as "we don't know", not "the search is bad".
+    judge_failed: bool = False
     
     def to_dict(self) -> Dict[str, float]:
-        """Convert metrics to dictionary format"""
+        """Return the metrics as a plain dict (used for history / CSV export)."""
         return {
             'answer_relevancy': self.answer_relevancy,
             'context_precision': self.context_precision,
             'faithfulness': self.faithfulness,
             'answer_correctness': self.answer_correctness,
-            'overall_score': self.overall_score
+            'overall_score': self.overall_score,
+            'judge_failed': self.judge_failed
         }
 
 class RAGEvaluator:
-    """RAGAS-powered search quality evaluator with history tracking"""
+    """Runs searches, scores them with RAGAS and keeps a history of the scores."""
     
-    def __init__(self, search_router: SearchRouter = None):
+    def __init__(self, search_router: SearchRouter = None, reranker: ReRanker = None):
         """Initialize RAGAS metrics and evaluation tracking.
 
         Pass in the app's SearchRouter. Building a new one here gives an
         empty index, so every search returns nothing and every score is 0.
+
+        Args:
+            reranker: the ReRanker whose real AI assessment gets judged by RAGAS (fix
+                for HW20, see prepare_ragas_data). Built lazily if not supplied.
         """
         self.search_router = search_router
+        self.reranker = reranker
         self.ragas_metrics = [
             answer_relevancy, context_precision, faithfulness, answer_correctness
         ]
         self.evaluation_history = []  # Track all evaluations
-    
-    # TODO: HW22 [Easy] - Count the cost before you run
-    # 4 metrics x top_k samples, and each metric makes 2-3 LLM calls. At 5
-    # requests/minute, how long does top_k=5 take? Show the estimate to the user
-    # before running, and consider which metrics are worth it.
+
+    @staticmethod
+    def estimate_cost(top_k: int, requests_per_minute: int = 5) -> Dict[str, Any]:
+        """Fix for HW22: count the cost before you run. Each of the 4 RAGAS metrics makes
+        roughly 2 LLM calls per candidate, PLUS one ReRanker call per candidate (fix for
+        HW20 - RAGAS now judges a real AI assessment, which itself costs a call).
+        Show this to the user BEFORE running, instead of finding out by waiting.
+
+        Returns: {'estimated_llm_calls', 'estimated_minutes'}
+        """
+        ragas_calls = len([answer_relevancy, context_precision, faithfulness, answer_correctness]) * 2
+        reranker_calls = 1
+        total_calls = (ragas_calls + reranker_calls) * max(top_k, 1)
+        minutes = total_calls / max(requests_per_minute, 1)
+        return {"estimated_llm_calls": total_calls, "estimated_minutes": round(minutes, 1)}
+
     def evaluate_search_quality(self, query: str, expected_skills: List[str], 
                               search_mode: str = "deep", top_k: int = 5) -> RAGEvaluationMetrics:
-        """Run search and evaluate results using RAGAS quality metrics"""
+        """Run one search and score its results.
+
+        Args:
+            query:           the search text to test.
+            expected_skills: skills a good candidate should have; used to build
+                             the "ground truth" labels.
+            search_mode:     "shallow", "deep" or "auto".
+            top_k:           how many results to evaluate (more = slower).
+
+        Returns:
+            RAGEvaluationMetrics. judge_failed=True (fix for HW21) if the search
+            returned nothing, an error occurred, or RAGAS itself could not score
+            every row - so a caller can tell "the search is bad" from "we don't know".
+        """
+        estimate = self.estimate_cost(top_k)
+        logger.warning(
+            f"RAGAS evaluation of top_k={top_k}: ~{estimate['estimated_llm_calls']} LLM calls, "
+            f"~{estimate['estimated_minutes']} min at the free tier's 5 requests/minute."
+        )
         
         try:
             search_router = self.search_router or SearchRouter()
@@ -72,18 +143,29 @@ class RAGEvaluator:
             return self.create_default_metrics()
     
     def create_default_metrics(self) -> RAGEvaluationMetrics:
-        """Return zero metrics when search fails or returns no results"""
+        """Build a metrics object with every value 0.0 (used on failure / empty results).
+
+        Fix for HW21: judge_failed=True flags that this 0.0 is NOT a real quality score -
+        there was nothing to evaluate, or evaluation itself broke - so it should never be
+        read as "the search returned bad candidates".
+        """
         return RAGEvaluationMetrics(
             answer_relevancy=0.0,
             context_precision=0.0,
             faithfulness=0.0,
             answer_correctness=0.0,
-            overall_score=0.0
+            overall_score=0.0,
+            judge_failed=True
         )
     
     def evaluate_with_ragas(self, query: str, candidates: List[Dict], 
                             expected_skills: List[str]) -> RAGEvaluationMetrics:
-        """Run RAGAS evaluation on search results and calculate final metrics"""
+        """Score the candidates with RAGAS and record the outcome.
+
+        Builds the dataset, calls ragas.evaluate() with Gemini as the judge
+        (LLM + embeddings), averages each metric over all rows, computes the
+        weighted overall score and appends the result to evaluation_history.
+        """
         
         evaluation_data = self.prepare_ragas_data(query, candidates, expected_skills)
         results = evaluate(
@@ -95,12 +177,20 @@ class RAGEvaluator:
         )
         table = results.to_pandas()
 
+        # Fix for HW21: each column_mean() call also reports whether the judge failed
+        # to score that metric at all (NaN/missing), instead of silently becoming 0.0.
+        relevancy, relevancy_failed = self.column_mean(table, 'answer_relevancy')
+        precision, precision_failed = self.column_mean(table, 'context_precision')
+        faith, faith_failed = self.column_mean(table, 'faithfulness')
+        correctness, correctness_failed = self.column_mean(table, 'answer_correctness')
+
         metrics = RAGEvaluationMetrics(
-            answer_relevancy=self.column_mean(table, 'answer_relevancy'),
-            context_precision=self.column_mean(table, 'context_precision'),
-            faithfulness=self.column_mean(table, 'faithfulness'),
-            answer_correctness=self.column_mean(table, 'answer_correctness'),
-            overall_score=0.0
+            answer_relevancy=relevancy,
+            context_precision=precision,
+            faithfulness=faith,
+            answer_correctness=correctness,
+            overall_score=0.0,
+            judge_failed=any([relevancy_failed, precision_failed, faith_failed, correctness_failed])
         )
         
         metrics.overall_score = self.calculate_overall_score(metrics)
@@ -108,42 +198,60 @@ class RAGEvaluator:
         
         return metrics
     
-    # TODO: HW20 [Hard] - What is actually being evaluated?
-    # Read this function carefully. The 'context' is built from metadata that is
-    # empty (HW1), and the 'answer' is a sentence generated by this code, not by
-    # the AI. What does faithfulness mean for a template string checked against
-    # 'No metadata'?
-    # Redesign it so RAGAS judges something real - for example the re-ranker's
-    # assessment (response) against the candidate's resume text (context).
-    # Hint: Session 8 - the question / context / answer triple.
     def prepare_ragas_data(self, query: str, candidates: List[Dict], 
                            expected_skills: List[str]) -> pd.DataFrame:
-        """Convert search results to RAGAS-compatible DataFrame format"""
-        
+        """Turn search results into a DataFrame with the four RAGAS columns.
+
+        Columns: question, contexts (list of strings), ground_truth, answer.
+        One row is created per candidate.
+
+        Fix for HW20: the old version built 'context' from metadata that was usually
+        empty (fixed now by HW1/HW9, but still just a few keywords), and 'answer' was a
+        hand-written template sentence like "{name} with skills in {skills}" - never
+        produced by an AI. RAGAS was therefore judging its own template against itself,
+        so "faithfulness" and "answer_relevancy" measured nothing real.
+
+        This version judges something real:
+          question -> the actual search query
+          context  -> the candidate's real resume text
+          answer   -> the ReRanker's real AI-generated fit assessment (summary +
+                      strengths) for that resume against this query, treated as a job
+        This costs one extra ReRanker call per candidate (see estimate_cost / HW22).
+        """
+        reranker = self.reranker or ReRanker()
+        # A minimal ad-hoc JobDescription built from the query itself - this evaluation
+        # has no separate job posting, so the query IS the job requirement being judged.
+        jd = JobDescription(jd_id="ragas_eval", title=query, text=query)
+
         data = []
         for candidate in candidates:
             metadata = candidate.get('metadata', {})
-            
-            # Create context from candidate metadata
-            context_parts = []
-            if 'name' in metadata:
-                context_parts.append(f"Name: {metadata['name']}")
-            if 'skills' in metadata:
-                context_parts.append(f"Skills: {', '.join(metadata['skills'][:5])}")
-            if 'experience' in metadata:
-                context_parts.append(f"Experience: {metadata['experience']} years")
-            
-            context = " | ".join(context_parts) if context_parts else "No metadata"
-            
-            # Create ground truth and generated answer
-            ground_truth = self.create_ground_truth(metadata.get('skills', []), expected_skills)
-            generated_answer = f"{metadata.get('name', 'Candidate')} with skills in {', '.join(metadata.get('skills', [])[:3])}"
+            resume_text = candidate.get('text', '') or candidate.get('page_content', '')
+            skills = candidate.get('skills') or metadata.get('skills', [])
+            experience = candidate.get('experience') or metadata.get('experience', 0)
+
+            # Schema-required fields with no bearing on what gets judged (the prompt
+            # only ever sends jd.text and resume.text to the LLM - see ReRanker).
+            resume = Resume(
+                candidate_id=candidate.get('candidate_id', 'unknown'),
+                name=candidate.get('name', metadata.get('name', 'Unknown')),
+                email="unknown@example.com",
+                phone="Not provided",
+                experience=experience or 0,
+                skills=skills or [],
+                education="Not specified",
+                text=resume_text,
+            )
+            evaluation = reranker.evaluate_candidate(resume, jd)
+            real_answer = f"{evaluation.summary} Strengths: {', '.join(evaluation.strengths)}".strip()
+
+            ground_truth = self.create_ground_truth(skills, expected_skills)
             
             data.append({
                 'question': query,
-                'contexts': [context],
+                'contexts': [resume_text or "No resume text available"],
                 'ground_truth': ground_truth,
-                'answer': generated_answer
+                'answer': real_answer or "No assessment generated"
             })
         
         return pd.DataFrame(data)
@@ -166,6 +274,7 @@ class RAGEvaluator:
 
     @staticmethod
     def judge_llm():
+        """Gemini wrapped for RAGAS to use as the "judge" model (shares the app's rate limiter)."""
         from ragas.llms import LangchainLLMWrapper
         from langchain_google_genai import ChatGoogleGenerativeAI
         from utils.config import GOOGLE_API_KEY, LLM_MODEL
@@ -176,6 +285,7 @@ class RAGEvaluator:
 
     @staticmethod
     def judge_embeddings():
+        """Google embeddings wrapped for RAGAS (needed by the answer_relevancy metric)."""
         from ragas.embeddings import LangchainEmbeddingsWrapper
         from utils.utils import get_embeddings
         return LangchainEmbeddingsWrapper(get_embeddings())
@@ -188,20 +298,33 @@ class RAGEvaluator:
         from ragas.run_config import RunConfig
         return RunConfig(max_workers=1, timeout=900, max_retries=10, max_wait=60)
 
-    # TODO: HW21 [Medium] - A score of 0.00 might mean the judge failed
-    # RAGAS returns NaN when the judge cannot decide (quota, timeout, bad JSON).
-    # This turns NaN - and missing columns - into 0.0, which looks like a terrible
-    # score. How would a user tell 'the search is bad' from 'the judge failed'?
-    # Hint: Session 8 - the smoke test, and why a number is not proof it worked.
     @staticmethod
-    def column_mean(table: pd.DataFrame, column: str) -> float:
+    def column_mean(table: pd.DataFrame, column: str) -> tuple:
+        """Average of one metric column, ignoring NaN - and whether the judge failed.
+
+        Fix for HW21: RAGAS returns NaN when the judge cannot decide (quota, timeout,
+        bad JSON), and the old code turned that into 0.0, indistinguishable from a
+        genuinely bad score. This now returns (mean, failed): failed is True when the
+        column is missing entirely, or when EVERY row for it came back NaN - so the
+        caller can tell "the search is bad" (a real low score) apart from "the judge
+        failed" (no usable score at all).
+
+        Returns:
+            (float mean [0.0 if nothing usable], bool failed)
+        """
         if column not in table.columns:
-            return 0.0
+            return 0.0, True
         values = table[column].dropna()
-        return float(values.mean()) if len(values) else 0.0
+        if len(values) == 0:
+            return 0.0, True
+        return float(values.mean()), False
 
     def create_ground_truth(self, candidate_skills: List[str], expected_skills: List[str]) -> str:
-        """Generate ground truth labels based on skill matching percentage"""
+        """Create the expected-answer text from how many expected skills the candidate has.
+
+        >=80% -> "Excellent match", >=60% -> "Good", >=40% -> "Moderate",
+        otherwise "Poor", each with a "x/y skills" count.
+        """
         if not expected_skills:
             return "No skills specified"
          
@@ -219,7 +342,7 @@ class RAGEvaluator:
             return f"Poor match: {len(matched_skills)}/{len(expected_skills)} skills"
     
     def calculate_overall_score(self, metrics: RAGEvaluationMetrics) -> float:
-        """Compute weighted average of all RAGAS metrics"""
+        """Weighted average: relevancy 30%, precision 30%, faithfulness 20%, correctness 20%."""
         weights = {
             'answer_relevancy': 0.30,
             'context_precision': 0.30,
@@ -237,7 +360,7 @@ class RAGEvaluator:
         return overall_score
     
     def store_evaluation(self, query: str, metrics: RAGEvaluationMetrics):
-        """Save evaluation results to history for later analysis"""
+        """Append {query, timestamp, metrics} to the in-memory evaluation history."""
         evaluation_record = {
             'query': query,
             'timestamp': pd.Timestamp.now(),
@@ -247,7 +370,7 @@ class RAGEvaluator:
         self.evaluation_history.append(evaluation_record)
     
     def get_evaluation_summary(self) -> Dict[str, Any]:
-        """Get summary statistics of all evaluations performed"""
+        """Return the number of evaluations, the average of every metric and the 5 most recent records."""
         if not self.evaluation_history:
             return {"message": "No evaluations performed yet"}
         
@@ -265,7 +388,7 @@ class RAGEvaluator:
         }
     
     def export_evaluations(self, filename: str = "rag_evaluations.csv") -> bool:
-        """Export all evaluation history to CSV file for analysis"""
+        """Write the evaluation history to a CSV file (one row per evaluation). Returns True on success."""
         if not self.evaluation_history:
             return False
         

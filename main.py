@@ -1,8 +1,8 @@
 """
-HireFlow - Comprehensive AI-Powered Candidate Search Engine
-===========================================================
+main.py  -  HireFlow command-line demo and orchestrator
+=======================================================
 
-This is the main entry point for testing and demonstrating all HireFlow capabilities:
+This is the entry point that WIRES ALL MODULES TOGETHER and demonstrates them:
 - Complete document processing pipeline (PDF → Text → Embeddings → Index)
 - Multiple search modes (Vector, Hybrid BM25+Vector, AI-Enhanced)
 - AI-powered evaluation and re-ranking with Gemini LLM
@@ -11,6 +11,21 @@ This is the main entry point for testing and demonstrating all HireFlow capabili
 - System health monitoring and diagnostics
 
 Usage: python main.py
+
+Program flow (see main() at the bottom)
+    1. check_prerequisites()      API keys set? data folders contain PDFs?
+    2. initialize_system()        create every component (order matters, below)
+    3. load_and_index_documents() PDFs -> Documents -> BM25 + Pinecone indexes
+    4. automatic demos            search modes, AI evaluation, memory, diagnostics
+    5. interactive_menu()         run any demo again, RAGAS evaluation, re-index
+
+Component wiring (who shares what)
+    VectorStore ──shared──> HybridIndexer ──shared──> SearchRouter ──> RAGEvaluator
+    ReRanker, ResumeParser, JobParser and MemoryRAG are independent.
+    Sharing ONE VectorStore / HybridIndexer means one Pinecone connection and
+    one filled index; creating a second copy would give an empty index.
+
+Return codes: main() returns 0 on success / user exit and 1 on setup failure.
 """
 
 import os
@@ -31,10 +46,16 @@ from utils.schemas import JobDescription, Resume
 logger = get_logger(__name__)
 
 class HireFlowDemo:
-    """Comprehensive HireFlow system demonstration and testing"""
+    """Holds every HireFlow component and the demo actions that use them.
+
+    Attributes:
+        components:   dict name -> instance (filled by initialize_system()).
+        system_ready: True once initialisation succeeded.
+        resume_dir / jd_dir: folders that are scanned for PDFs.
+    """
     
     def __init__(self):
-        """Initialize all HireFlow components"""
+        """Create the (empty) component registry and set the data folder paths."""
         self.components = {
             'vector_store': None,
             'hybrid_indexer': None,
@@ -50,14 +71,21 @@ class HireFlowDemo:
         self.jd_dir = "data/jds"
         
     def show_banner(self):
-        """Display HireFlow banner"""
+        """Print the title banner."""
         print("\n" + "="*70)
         print("HireFlow - AI-Powered Candidate Search Engine")
         print("Complete System Demonstration & Testing Platform")
         print("="*70)
         
     def check_prerequisites(self) -> bool:
-        """Check if all prerequisites are met"""
+        """Verify the environment before doing any expensive work.
+
+        Checks: GOOGLE_API_KEY and PINECONE_API_KEY are set, both data folders
+        exist and each contains at least one .pdf file.
+
+        Returns:
+            True if everything is present, False (with a printed reason) otherwise.
+        """
         print("\nChecking Prerequisites...")
         
         # Check API keys
@@ -91,7 +119,15 @@ class HireFlowDemo:
         return True
     
     def initialize_system(self) -> bool:
-        """Initialize all HireFlow components"""
+        """Create and connect every component in dependency order.
+
+        Order: VectorStore -> HybridIndexer(vector_store) -> SearchRouter(indexer)
+               -> ReRanker / ResumeParser / JobParser -> RAGEvaluator(router)
+               -> MemoryRAG.
+
+        Returns:
+            True if all components were created, False on any error.
+        """
         print("\nInitializing HireFlow System...")
         
         try:
@@ -138,7 +174,12 @@ class HireFlowDemo:
             return False
     
     def load_and_index_documents(self) -> bool:
-        """Load and index all documents"""
+        """Read the PDFs and fill the search indexes.
+
+        1. load_resumes() / load_job_descriptions()  (core/ingestion.py)
+        2. HybridIndexer.index_*()  -> builds BM25 AND uploads to Pinecone (once)
+        Also used by menu option 6 to re-index.
+        """
         print("\nLoading and Indexing Documents...")
         
         try:
@@ -164,14 +205,13 @@ class HireFlowDemo:
                 return False
             print("   OK: Job descriptions indexed")
             
-            # Also index in vector store for direct vector search
-            print("   Adding to vector store...")
-            # TODO: HW24 [Easy] - Every resume is embedded twice
-            # index_resumes() above already adds the resumes to the vector store.
-            # These two lines embed and upload everything a second time.
-            self.components['vector_store'].add_resumes(resumes)
-            self.components['vector_store'].add_job_descriptions(jds)
-            print("   OK: Documents added to vector store")
+            # Fix for HW24: index_resumes()/index_job_descriptions() above already embed
+            # and upsert to Pinecone when the vector store is ready (see
+            # HybridIndexer.index_resumes() in core/hybrid_indexer.py). Calling
+            # vector_store.add_resumes()/add_job_descriptions() again here used to embed
+            # and upload every document a SECOND time - doubling the Gemini embedding
+            # calls and the Pinecone upserts for no benefit, since upsert-by-id (HW6)
+            # just overwrote the same vectors with an identical copy.
             
             return True
             
@@ -180,7 +220,13 @@ class HireFlowDemo:
             return False
     
     def test_search_modes(self):
-        """Test different search modes"""
+        """Demo: run the same query through the three search strategies and compare.
+
+        1. Vector search  - semantic only (VectorStore)
+        2. Hybrid search  - BM25 + vector (HybridIndexer)
+        3. Router "deep"  - hybrid + LLM re-ranking (SearchRouter)
+        The search is also recorded in MemoryRAG.
+        """
         print("\nSearch Mode Demonstrations")
         print("-" * 40)
         
@@ -224,7 +270,12 @@ class HireFlowDemo:
         self.components['memory'].record_search(search_query, len(candidates))
     
     def test_ai_evaluation(self):
-        """Test AI-powered candidate evaluation"""
+        """Demo: parse a job description and let the LLM evaluate the top candidate.
+
+        Flow: load first JD PDF -> JobParser -> JobDescription model ->
+        search "senior accountant" -> take result #1 -> ReRanker.evaluate_candidate()
+        -> print fit score, strengths, gaps and summary.
+        """
         print("\nAI Evaluation Demonstration")
         print("-" * 40)
         
@@ -272,7 +323,11 @@ class HireFlowDemo:
             print(f"ERROR: AI evaluation failed: {e}")
     
     def test_quality_metrics(self):
-        """Test search quality evaluation with RAGAS"""
+        """Demo: score one query with RAGAS (slow on the free API tier).
+
+        Prints the four metrics, the weighted overall score and a verdict
+        (>= 0.8 excellent, >= 0.6 good, otherwise needs improvement).
+        """
         print("\nSearch Quality Evaluation (RAGAS)")
         print("-" * 40)
         
@@ -306,7 +361,7 @@ class HireFlowDemo:
             print(f"ERROR: Quality evaluation failed: {e}")
     
     def test_memory_system(self):
-        """Test conversation memory and tracking"""
+        """Demo: print memory statistics and the last few searches."""
         print("\nMemory System Demonstration")
         print("-" * 40)
         
@@ -327,7 +382,7 @@ class HireFlowDemo:
             print("\nNo search history yet")
     
     def check_system_status(self):
-        """Check comprehensive system status"""
+        """Print diagnostics: Pinecone vector count / dimension and the hybrid indexer's readiness flags."""
         print("\nSystem Diagnostics")
         print("-" * 40)
         
@@ -351,7 +406,11 @@ class HireFlowDemo:
             print(f"Hybrid Ready: {hybrid_stats.get('hybrid_ready', False)}")
     
     def display_results(self, results: List[Dict], max_show: int = 3):
-        """Display search results in a formatted way"""
+        """Print up to `max_show` results as "name / score / experience / top-3 skills".
+
+        Accepts both result shapes in the project: vector results (values under
+        'metadata') and hybrid / router results (values at the top level).
+        """
         for i, result in enumerate(results[:max_show], 1):
             metadata = result.get('metadata') or result
             name = metadata.get('name') or result.get('name') or f'Candidate {i}'
@@ -363,7 +422,7 @@ class HireFlowDemo:
             print(f"      Score: {score:.3f} | Experience: {experience} | Skills: {', '.join(skills[:3])}")
     
     def interactive_menu(self):
-        """Interactive menu for exploring HireFlow features"""
+        """Loop showing a 7-option menu until the user exits (option 7) or presses Ctrl+C."""
         print("\nInteractive HireFlow Explorer")
         print("=" * 50)
         
@@ -408,7 +467,11 @@ class HireFlowDemo:
                 print(f"ERROR: {e}")
 
 def main():
-    """Main entry point for HireFlow comprehensive demonstration"""
+    """Run prerequisites -> initialise -> index -> demos -> menu.
+
+    Returns:
+        Process exit code: 0 = OK / user quit, 1 = a setup step failed.
+    """
     demo = HireFlowDemo()
     
     try:
